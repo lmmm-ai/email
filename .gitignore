@@ -2,3 +2,14 @@
 state/
 __pycache__/
 *.pyc
+*.pyo
+
+# 本地虚拟环境 / 编辑器
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# 临时日志
+*.log

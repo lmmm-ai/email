@@ -1,13 +1,15 @@
 name: mail-check
 
-# 第 3 步：定时取信 -> 清洗正文 -> LLM 分级（摘要/紧急度/待办）-> 打印工作清单。
-# 仍然只打印，不建 Issue、不发通知（第 4 步）。
+# 定时跑完整四步管线：取信 -> 清洗正文 -> LLM 分级 -> 投递（群机器人 + 日报）。
+# 只用 P0/P1 打扰你：P2/P3 只在日报里出现，不进群消息。
 
 on:
   schedule:
-    # 注意：GitHub 的 cron 一律是 UTC。
-    # */30 1-14 * * 1-5  =>  北京时间 09:00–22:30，每 30 分钟，周一到周五
-    - cron: "*/30 1-14 * * 1-5"
+    # GitHub 的 cron 一律是 UTC。下面注释写的是北京时间（UTC+8）。
+    # 工作日：08:00–23:30 之间每 30 分钟一次
+    - cron: "*/30 0-15 * * 1-5"
+    # 周末：一天三个时间点兜底，避免周末的紧急邮件拖到周一
+    - cron: "0 2,8,14 * * 6,0"
   workflow_dispatch:
     inputs:
       limit:
@@ -22,6 +24,10 @@ on:
         description: "调试用：填 true 则只清洗不调模型（不花钱）"
         required: false
         default: ""
+      deliver:
+        description: "投递方式：auto / none / webhook / digest / both"
+        required: false
+        default: "auto"
 
 # 同一时间只允许一个实例，避免两次运行同时读写游标
 concurrency:
@@ -36,6 +42,14 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+      QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+      # 仓库是公开的，Actions 日志谁都能看：强制打码发件人
+      LOG_MASK: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,24 +75,43 @@ jobs:
             echo "state 分支还不存在（首次运行）"
           fi
 
-      - name: 取信 + 清洗 + 分级
+      - name: 取信 + 清洗 + 分级 + 投递
+        id: mail
         env:
-          QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
-          QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
-          # 没配 LLM_API_KEY 时会自动降级为"只清洗不分级"，不会报错
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
-          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
           set -euo pipefail
           args=(--state state/mail_state.json --limit "${{ inputs.limit || 20 }}")
+          args+=(--deliver "${{ inputs.deliver || 'auto' }}")
+          args+=(--notify-min P1 --mask)
+          args+=(--digest-dir "$RUNNER_TEMP/digest")
           if [ -n "${{ inputs.uids }}" ]; then
             args+=(--uid "${{ inputs.uids }}")
           fi
           if [ -n "${{ inputs.no_llm }}" ]; then
-            args+=(--no-llm)
+            args+=(--no-llm --deliver none)
           fi
           python scripts/fetch_mail.py "${args[@]}"
+
+      - name: 把日报写进本次运行摘要
+        if: always()
+        run: |
+          set -euo pipefail
+          f=$(ls -1 "$RUNNER_TEMP"/digest/*.md 2>/dev/null | tail -n 1 || true)
+          if [ -n "$f" ]; then
+            cat "$f" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "本次没有生成日报。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 上传日报
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mail-digest-${{ github.run_id }}
+          path: ${{ runner.temp }}/digest/*.md
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: 保存游标（推回 state 分支）
         if: always()

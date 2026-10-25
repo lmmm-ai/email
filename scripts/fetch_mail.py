@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
-"""QQ 邮箱取信 + 清洗 + LLM 分级 —— 第 3 步。
+"""QQ 邮箱 → 每日工作清单：取信、清洗、LLM 分级、投递到企业微信/飞书。
 
-做什么：
-  1. UID 游标增量取信
-  2. 取正文，剥引用/签名，判定噪音（第 2 步）
-  3. 丢给 LLM 做三件事：一句话摘要、P0-P3 紧急度、待办清单（第 3 步）
-  4. 按紧急度分组打印成"工作清单"
+管线（每一步都是纯函数，可以单独测）：
+  1. 取信   UID 游标增量拉取，只读 SELECT，BODY.PEEK 不改已读
+  2. 清洗   MIME 解码 → HTML 转文本 → 剥引用/签名 → 噪音判定
+  3. 分级   LLM 输出一句话摘要 / P0-P3 / 待办清单 / 截止时间
+  4. 投递   P0/P1 推群机器人，全量写一份 Markdown 日报
 
-不做什么：不建 Issue、不发通知、不回邮件（第 4 步）、不改邮件已读状态。
+不做什么：不回邮件、不删邮件、不改已读状态。
 
-只依赖 Python 3.9+ 标准库（LLM 走 urllib，不需要 openai SDK）。
+只依赖 Python 3.9+ 标准库（模型和 webhook 都走 urllib，不需要第三方 SDK）。
 
-本地试跑：
-  set QQ_EMAIL=1032867463@qq.com
+三种跑法：
+  # ① 离线演示：不连邮箱、不要任何密钥，用仓库里的样例邮件跑完整链路
+  python scripts/fetch_mail.py --demo
+
+  # ② 本地真跑
+  set QQ_EMAIL=xxx@qq.com
   set QQ_AUTH_CODE=16位授权码
   set LLM_API_KEY=sk-xxx
+  python scripts/fetch_mail.py --uid 34,36,38 --preview 300   # 预览，不动游标
+  python scripts/fetch_mail.py --uid 34,36,38 --no-llm        # 只看清洗，不花钱
 
-  # 预览已有邮件的分级结果（不动游标）
-  python scripts/fetch_mail.py --uid 34,36,38 --preview 300
+  # ③ 生产：GitHub Actions 每 30 分钟一轮，见 .github/workflows/mail-check.yml
 
-  # 只看清洗，不花钱调 LLM
-  python scripts/fetch_mail.py --uid 34,36,38 --no-llm
+退出码：0 正常 / 1 未预期异常 / 2 配置缺失 / 3 IMAP 失败 / 4 模型全部失败 / 5 投递失败
 """
 
 from __future__ import annotations
@@ -39,9 +43,13 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
-from email.parser import BytesHeaderParser
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+import deliver  # noqa: E402  同目录的投递层（企业微信/飞书/日报）
 
 DEFAULT_HOST = "imap.qq.com"
 DEFAULT_PORT = 993
@@ -53,9 +61,29 @@ CST = timezone(timedelta(hours=8))
 # 必须先把它注册进去，否则 _command() 会直接抛 "command ID illegal"。
 imaplib.Commands["ID"] = ("AUTH", "SELECTED")
 
-HEADER_FIELDS = "FROM TO CC DATE SUBJECT MESSAGE-ID"
+STATE_VERSION = 3
+DELIVERED_KEEP = 500  # delivered 台账最多保留多少条 message_id
 
 log = logging.getLogger("mailbot")
+
+
+# --------------------------------------------------------------------------- #
+# 打码：公开仓库的日志和日报不暴露真实地址
+# --------------------------------------------------------------------------- #
+def mask_addr(addr: str) -> str:
+    if addr and "@" in addr:
+        local, _, domain = addr.partition("@")
+        return f"{local[:1]}***@{domain}"
+    return addr or ""
+
+
+def mask_sender(name: str, addr: str) -> str:
+    """保留名字首字和域名，中间打码。"""
+    masked = mask_addr(addr)
+    name = str(name or "").strip()
+    if name:
+        return f"{name[0]}*** <{masked}>" if masked else f"{name[0]}***"
+    return masked or "(未知发件人)"
 
 
 # --------------------------------------------------------------------------- #
@@ -63,11 +91,13 @@ log = logging.getLogger("mailbot")
 # --------------------------------------------------------------------------- #
 def empty_state() -> dict:
     return {
-        "version": 2,
+        "version": STATE_VERSION,
         "uidvalidity": None,
         "last_uid": 0,
         "initialized": False,
         "last_run": None,
+        "delivered": {},
+        "stats": {"runs": 0, "tokens_in": 0, "tokens_out": 0},
     }
 
 
@@ -79,10 +109,30 @@ def load_state(path: Path) -> dict:
         data = json.loads(path.read_text("utf-8"))
         if not isinstance(data, dict):
             raise ValueError("state 不是 JSON 对象")
-        return {**empty_state(), **data}
     except Exception as exc:  # 状态坏了就重新初始化，不要让整条链挂掉
         log.warning("状态文件无法解析（%s），按首次运行处理", exc)
         return empty_state()
+
+    state = {**empty_state(), **data}
+    # v1/v2 没有 delivered / stats。老代码有个坑：data 里的 version 覆盖了新值，
+    # 版本号永远停在 1，所以这里显式补字段并强制写回当前版本。
+    old_version = int(data.get("version") or 1)
+    if not isinstance(state.get("delivered"), dict):
+        state["delivered"] = {}
+    if not isinstance(state.get("stats"), dict):
+        state["stats"] = {"runs": 0, "tokens_in": 0, "tokens_out": 0}
+    if old_version < STATE_VERSION:
+        log.info("状态文件版本 v%s -> v%s，已就地迁移", old_version, STATE_VERSION)
+    state["version"] = STATE_VERSION
+    return state
+
+
+def prune_delivered(delivered: dict) -> dict:
+    """台账只留最近的若干条，避免 state 无限膨胀。"""
+    if len(delivered) <= DELIVERED_KEEP:
+        return delivered
+    keep = list(delivered)[-DELIVERED_KEEP:]
+    return {k: delivered[k] for k in keep}
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -404,6 +454,19 @@ def _iter_leaf_parts(part: email.message.Message):
     yield part
 
 
+def _is_stub_plain(plain: str, html: str) -> bool:
+    """plain 只是"请用 HTML 客户端查看"这类占位句时返回 True。
+
+    很多客户端发 multipart/alternative 会把真正的正文只放在 HTML 里，
+    plain 分支留一句占位。按"plain 优先"会把整封邮件读成一句废话。
+    """
+    if not html or len(plain) >= 120:
+        return False
+    if len(html) < len(plain) * 2:
+        return False
+    return bool(re.search(r"(?i)html|请用|格式|客户端|查看|浏览器", plain))
+
+
 def extract_body(msg: email.message.Message) -> tuple[str, str, int]:
     """返回 (原始正文, 类型 plain/html/none, 附件数)。"""
     plain: list[str] = []
@@ -427,10 +490,15 @@ def extract_body(msg: email.message.Message) -> tuple[str, str, int]:
         else:
             html_parts.append(text)
 
-    if plain:
-        return "\n".join(plain), "plain", attachments
-    if html_parts:
-        return html_to_text("\n".join(html_parts)), "html", attachments
+    plain_text = "\n".join(plain).strip()
+    html_text = html_to_text("\n".join(html_parts)).strip() if html_parts else ""
+
+    if plain_text and not _is_stub_plain(plain_text, html_text):
+        return plain_text, "plain", attachments
+    if html_text:
+        return html_text, "html", attachments
+    if plain_text:
+        return plain_text, "plain", attachments
     return "", "none", attachments
 
 
@@ -485,22 +553,27 @@ def recipient_role(msg: email.message.Message, me: str) -> str:
 # --------------------------------------------------------------------------- #
 # 单封处理
 # --------------------------------------------------------------------------- #
-def process(conn: imaplib.IMAP4_SSL, uid: int, size: int, args, me: str) -> dict | None:
-    raw, truncated = fetch_body(conn, uid, size, args.max_bytes)
-    if raw is None:
-        return None
+def build_record(raw: bytes, uid: int, size: int, truncated: bool, args, me: str) -> dict:
+    """把一封原始邮件变成结构化 record。纯函数，不碰 IMAP —— 离线演示和单测都靠它。"""
     msg = email.message_from_bytes(raw)
 
     sender_name, sender_addr = parseaddr(decode_mime(msg.get("From")))
     sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr or "(未知发件人)"
+    if getattr(args, "mask", False):
+        sender = mask_sender(sender_name, sender_addr)
 
     body_raw, kind, attachments = extract_body(msg)
     body, removed_quote = strip_quoted(body_raw)
     body, removed_sig = strip_signature(body)
     body = normalize_ws(body)
 
+    message_id = (decode_mime(msg.get("Message-ID")) or "").strip()
+    if not message_id:  # 极少数邮件没有 Message-ID，用 UID 兜底
+        message_id = f"uid:{uid}"
+
     return {
         "uid": uid,
+        "message_id": message_id,
         "size": size,
         "truncated": truncated,
         "subject": decode_mime(msg.get("Subject")) or "(无主题)",
@@ -516,6 +589,13 @@ def process(conn: imaplib.IMAP4_SSL, uid: int, size: int, args, me: str) -> dict
         "removed_sig": removed_sig,
         "body": body,
     }
+
+
+def process(conn: imaplib.IMAP4_SSL, uid: int, size: int, args, me: str) -> dict | None:
+    raw, truncated = fetch_body(conn, uid, size, args.max_bytes)
+    if raw is None:
+        return None
+    return build_record(raw, uid, size, truncated, args, me)
 
 
 def report(rec: dict, index: int, total: int, preview: int, max_bytes: int) -> None:
@@ -702,6 +782,39 @@ def _parse_json_items(content: str) -> list[dict]:
     return [it for it in items if isinstance(it, dict)]
 
 
+def _norm_dt(value) -> str | None:
+    """把模型给的自由文本时间归一成 ISO（2026-10-25 或 2026-10-25T18:00）。
+
+    模型经常写"本周五""下周三下午"这种没法排序的字符串。归一不了就丢掉 ——
+    投递层要按截止时间排序提醒，自由文本没有用。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    with_time = re.search(
+        r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?[ T]*(\d{1,2})[:：](\d{2})", text
+    )
+    date_only = re.search(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?", text)
+    try:
+        if with_time:
+            dt = datetime(
+                int(with_time.group(1)),
+                int(with_time.group(2)),
+                int(with_time.group(3)),
+                int(with_time.group(4)),
+                int(with_time.group(5)),
+            )
+            return dt.strftime("%Y-%m-%dT%H:%M")
+        if date_only:
+            dt = datetime(
+                int(date_only.group(1)), int(date_only.group(2)), int(date_only.group(3))
+            )
+            return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+    return None
+
+
 def _normalize_item(item: dict, rec: dict) -> dict:
     priority = str(item.get("priority") or "").strip().upper()
     if priority not in PRIORITY_ORDER:
@@ -714,7 +827,7 @@ def _normalize_item(item: dict, rec: dict) -> dict:
         if isinstance(act, dict):
             title = str(act.get("title") or "").strip()
             if title:
-                actions.append({"title": title, "due": act.get("due") or None})
+                actions.append({"title": title, "due": _norm_dt(act.get("due"))})
         elif isinstance(act, str) and act.strip():
             actions.append({"title": act.strip(), "due": None})
 
@@ -723,7 +836,7 @@ def _normalize_item(item: dict, rec: dict) -> dict:
         "summary": str(item.get("summary") or "").strip() or rec["subject"],
         "priority": priority,
         "reason": str(item.get("reason") or "").strip(),
-        "deadline": item.get("deadline") or None,
+        "deadline": _norm_dt(item.get("deadline")),
         "need_reply": bool(item.get("need_reply")),
         "action_items": actions,
         "source": "llm",
@@ -732,8 +845,13 @@ def _normalize_item(item: dict, rec: dict) -> dict:
 
 def classify(
     records: list[dict], cfg: dict, batch_size: int, skip_noise: bool, max_body: int
-) -> dict[int, dict]:
-    """返回 uid -> 判定结果。噪音邮件走规则，不花钱。"""
+) -> tuple[dict[int, dict], dict]:
+    """返回 (uid -> 判定结果, 统计)。
+
+    - 噪音邮件走规则判 P3，不花钱
+    - 单批失败只降级这一批（标 P2 并写明原因），不拖整轮下水
+    - 只有所有批次都失败才抛异常：调用方据此返回退出码 4、不推进游标
+    """
     results: dict[int, dict] = {}
     todo: list[dict] = []
 
@@ -752,44 +870,70 @@ def classify(
         else:
             todo.append(rec)
 
+    stats = {"tokens_in": 0, "tokens_out": 0, "batches": 0, "failed_batches": 0}
     if not todo:
-        return results
+        return results, stats
+
+    def fallback(rec: dict, reason: str) -> dict:
+        return {
+            "uid": rec["uid"],
+            "summary": rec["subject"],
+            "priority": "P2",
+            "reason": reason,
+            "deadline": None,
+            "need_reply": False,
+            "action_items": [],
+            "source": "fallback",
+        }
 
     today = datetime.now(CST).strftime("%Y-%m-%d %A")
-    tokens_in = tokens_out = 0
 
     for start in range(0, len(todo), batch_size):
         chunk = todo[start : start + batch_size]
+        stats["batches"] += 1
         log.info("调用模型：%d 封（%s）", len(chunk), cfg["model"])
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_user_message(chunk, today, max_body)},
         ]
 
-        content, usage = call_llm(cfg, messages)
         try:
-            items = _parse_json_items(content)
+            content, usage = call_llm(cfg, messages)
+            try:
+                items = _parse_json_items(content)
+            except Exception as exc:
+                log.warning("模型输出不是合法 JSON（%s），追加纠正指令重试一次", exc)
+                messages = messages + [
+                    {"role": "assistant", "content": (content or "")[:2000]},
+                    {
+                        "role": "user",
+                        "content": "你上面的输出不是合法 JSON。请只输出一个 JSON 对象，"
+                        "不要代码块、不要解释，字段与要求一致。",
+                    },
+                ]
+                content, usage2 = call_llm(cfg, messages)
+                usage = {
+                    "prompt_tokens": (usage.get("prompt_tokens") or 0)
+                    + (usage2.get("prompt_tokens") or 0),
+                    "completion_tokens": (usage.get("completion_tokens") or 0)
+                    + (usage2.get("completion_tokens") or 0),
+                }
+                items = _parse_json_items(content)
         except Exception as exc:
-            log.warning("模型输出不是合法 JSON（%s），追加纠正指令重试一次", exc)
-            messages = messages + [
-                {"role": "assistant", "content": (content or "")[:2000]},
-                {
-                    "role": "user",
-                    "content": "你上面的输出不是合法 JSON。请只输出一个 JSON 对象，"
-                    "不要代码块、不要解释，字段与要求一致。",
-                },
-            ]
-            content, usage2 = call_llm(cfg, messages)
-            usage = {
-                "prompt_tokens": (usage.get("prompt_tokens") or 0)
-                + (usage2.get("prompt_tokens") or 0),
-                "completion_tokens": (usage.get("completion_tokens") or 0)
-                + (usage2.get("completion_tokens") or 0),
-            }
-            items = _parse_json_items(content)
+            # 这一批废了，但别让整轮一起死：降级 P2，继续下一批
+            stats["failed_batches"] += 1
+            log.error(
+                "第 %d 批（%d 封）分级失败，本批降级为 P2：%s",
+                stats["batches"],
+                len(chunk),
+                exc,
+            )
+            for rec in chunk:
+                results[rec["uid"]] = fallback(rec, f"模型调用失败：{exc}"[:120])
+            continue
 
-        tokens_in += int(usage.get("prompt_tokens") or 0)
-        tokens_out += int(usage.get("completion_tokens") or 0)
+        stats["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+        stats["tokens_out"] += int(usage.get("completion_tokens") or 0)
 
         by_uid: dict[int, dict] = {}
         for item in items:
@@ -802,22 +946,17 @@ def classify(
             item = by_uid.get(rec["uid"])
             if item is None:
                 log.warning("模型漏掉了 UID=%s，降级为 P2", rec["uid"])
-                results[rec["uid"]] = {
-                    "uid": rec["uid"],
-                    "summary": rec["subject"],
-                    "priority": "P2",
-                    "reason": "模型未返回这一封",
-                    "deadline": None,
-                    "need_reply": False,
-                    "action_items": [],
-                    "source": "fallback",
-                }
+                results[rec["uid"]] = fallback(rec, "模型未返回这一封")
             else:
                 results[rec["uid"]] = _normalize_item(item, rec)
 
-    if tokens_in or tokens_out:
-        log.info("模型消耗：输入 %d tokens，输出 %d tokens", tokens_in, tokens_out)
-    return results
+    if stats["tokens_in"] or stats["tokens_out"]:
+        log.info(
+            "模型消耗：输入 %d tokens，输出 %d tokens", stats["tokens_in"], stats["tokens_out"]
+        )
+    if stats["failed_batches"] and stats["failed_batches"] == stats["batches"]:
+        raise RuntimeError(f"{stats['batches']} 批模型调用全部失败")
+    return results, stats
 
 
 def render_digest(records: list[dict], results: dict[int, dict]) -> int:
@@ -864,6 +1003,192 @@ def render_digest(records: list[dict], results: dict[int, dict]) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# 第 4 步：投递
+# --------------------------------------------------------------------------- #
+def build_items(records: list[dict], results: dict[int, dict]) -> list[dict]:
+    """把 record 与判定结果合成投递用的扁平条目，按 P0→P3、截止时间排序。"""
+    rank = {p: i for i, p in enumerate(PRIORITY_ORDER)}
+    items: list[dict] = []
+    for rec in records:
+        res = results.get(rec["uid"]) or {}
+        items.append(
+            {
+                "uid": rec["uid"],
+                "message_id": rec.get("message_id") or f"uid:{rec['uid']}",
+                "priority": res.get("priority") or "P2",
+                "subject": rec["subject"],
+                "sender": rec["sender"],
+                "sender_addr": rec.get("sender_addr") or "",
+                "date": rec["date"],
+                "summary": res.get("summary") or rec["subject"],
+                "reason": res.get("reason") or "",
+                "deadline": res.get("deadline"),
+                "need_reply": bool(res.get("need_reply")),
+                "action_items": res.get("action_items") or [],
+                "noise": rec.get("noise") or [],
+                "attachments": rec.get("attachments") or 0,
+            }
+        )
+    items.sort(
+        key=lambda x: (rank.get(x["priority"], 9), x.get("deadline") or "9999", x["uid"])
+    )
+    return items
+
+
+def build_meta(
+    items: list[dict], started: datetime, channel: str = "", model: str = ""
+) -> dict:
+    now = datetime.now(CST)
+    counts = {p: 0 for p in PRIORITY_ORDER}
+    for it in items:
+        counts[it["priority"]] = counts.get(it["priority"], 0) + 1
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%Y-%m-%d %H:%M"),
+        "stamp": now.strftime("%Y%m%d-%H%M%S"),
+        "weekday": "一二三四五六日"[now.weekday()],
+        "total": len(items),
+        "counts": counts,  # deliver.render_markdown / format_header 要的是 {P0: n, ...}
+        "elapsed": max(0, int((now - started).total_seconds())),
+        "channel": channel,
+        "model": model,
+    }
+
+
+def pushable_items(items: list[dict], notify_min: str, delivered: dict) -> list[dict]:
+    """挑出要推送的：紧急度不低于阈值，且没在台账里（幂等，避免重复打扰）。"""
+    cut = PRIORITY_ORDER.index(notify_min)
+    return [
+        it
+        for it in items
+        if PRIORITY_ORDER.index(it["priority"]) <= cut
+        and it["message_id"] not in delivered
+    ]
+
+
+def deliver_all(
+    items: list[dict], args, meta: dict, state: dict
+) -> tuple[list, list[dict]]:
+    """按 --deliver 选择出口投递，返回 (各出口结果, 实际推送的条目)。"""
+    mode = args.deliver
+    pushed: list[dict] = []
+    out: list = []
+    if mode == "none":
+        return out, pushed
+
+    pushed = pushable_items(items, args.notify_min, state.get("delivered") or {})
+    url = (args.webhook_url or os.environ.get("WEBHOOK_URL") or "").strip()
+
+    if mode in ("auto", "webhook", "both"):
+        if not pushed:
+            log.info("没有需要推送的邮件（阈值 %s，或无新增）", args.notify_min)
+        elif not url:
+            log.warning("未配置 Webhook（--webhook-url 或 WEBHOOK_URL），跳过推送")
+            pushed = []
+        else:
+            out.append(deliver.deliver_webhook(url, pushed, meta))
+
+    if mode in ("auto", "digest", "both"):
+        out.append(deliver.write_digest(Path(args.digest_dir), items, meta))
+
+    return out, pushed
+
+
+def demo_classify(rec: dict) -> dict:
+    """演示用的规则替身：结构跟模型输出一致，但不联网、不花钱。"""
+    body = rec["body"]
+    text = f"{rec['subject']}\n{body}"
+    low = text.lower()
+
+    noise = rec.get("noise") or []
+    if noise:
+        priority, reason = "P3", "规则判定为噪音：" + "、".join(noise)
+    elif any(k in low for k in ("紧急", "今天", "asap", "urgent", "尽快", "投诉", "故障", "线上")):
+        priority, reason = "P0", "命中紧急关键词（紧急/今天/投诉/故障…）"
+    elif any(k in low for k in ("确认", "回复", "评审", "方案", "核对")):
+        priority, reason = "P1", "命中待办关键词（确认/回复/评审/方案/核对）"
+    else:
+        priority, reason = "P2", "规则未命中紧急或待办"
+
+    actions: list[dict] = []
+    for line in body.splitlines():
+        line = line.strip(" 　-·•")
+        if len(line) < 8 or line.endswith(("：", ":")):
+            continue
+        listed = line[0] in "123456789"
+        if listed or line.startswith(("请", "麻烦", "需要")):
+            title = line[2:].strip() if listed and line[1] in ".、)）" else line
+            actions.append({"title": title[:60], "due": None})
+
+    if priority == "P0" and rec["role"] == "cc":
+        priority = "P1"
+        reason += "；我这封在抄送里，降一级"
+
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    # 摘要素材：跳过"李工你好：""各位同事："这类称呼行和短句
+    summary = rec["subject"]
+    for ln in lines:
+        if len(ln) < 12 or ln.endswith(("：", ":")):
+            continue
+        summary = ln[:80]
+        break
+    return {
+        "uid": rec["uid"],
+        "summary": summary,
+        "priority": priority,
+        "reason": reason,
+        "deadline": _norm_dt(body),
+        "need_reply": ("回复" in text or "答复" in text),
+        "action_items": actions,
+        "source": "demo",
+    }
+
+
+def run_demo(args) -> int:
+    """不连 IMAP、不调模型的端到端演示：读 examples/emails/*.eml。
+
+    分级的"模型"由 demo_classify 顶替，其余环节（MIME 解码、正文清洗、
+    噪音判定、排序、Webhook/日报投递）全部是真代码。
+    """
+    root = Path(__file__).resolve().parent.parent / "examples" / "emails"
+    files = sorted(root.glob("*.eml"))[: args.limit]
+    if not files:
+        log.error("演示邮件不存在：%s（先跑 python examples/make_fixtures.py）", root)
+        return 2
+
+    started = datetime.now(CST)
+    log.info("离线演示：%d 封示例邮件（不连 IMAP、不调模型、不读真实游标）", len(files))
+    print("", flush=True)
+
+    records: list[dict] = []
+    for idx, path in enumerate(files, 1):
+        raw = path.read_bytes()
+        rec = build_record(raw, idx, len(raw), False, args, "demo@example.com")
+        records.append(rec)
+        report(rec, idx, len(files), args.preview, args.max_bytes)
+
+    results = {rec["uid"]: demo_classify(rec) for rec in records}
+    print("", flush=True)
+    render_digest(records, results)
+
+    items = build_items(records, results)
+    meta = build_meta(items, started, model="demo-rule（离线演示）")
+    print("", flush=True)
+
+    # 演示用空状态，绝不动真实游标文件
+    outs, pushed = deliver_all(items, args, meta, empty_state())
+    for r in outs:
+        log.info("投递 %s：%s —— %s", r.channel, "成功" if r.ok else "失败", r.detail)
+    if args.deliver == "none":
+        reach = pushable_items(items, args.notify_min, {})
+        log.info("演示完成：%d 封，其中 %d 封达到推送阈值（%s，本次未投递）",
+                 len(items), len(reach), args.notify_min)
+    else:
+        log.info("演示完成：%d 封，已推送 %d 封", len(items), len(pushed))
+    return 0 if all(r.ok for r in outs) else 5
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def parse_uid_list(raw: str) -> list[int]:
@@ -880,7 +1205,7 @@ def parse_uid_list(raw: str) -> list[int]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="QQ 邮箱取信 + 正文清洗")
+    p = argparse.ArgumentParser(description="QQ 邮箱取信 → 清洗 → 分级 → 投递（四步管线）")
     p.add_argument("--state", default="state/mail_state.json", help="游标文件路径")
     p.add_argument("--limit", type=int, default=20, help="本次最多处理多少封")
     p.add_argument("--folder", default="INBOX", help="信箱名，默认 INBOX")
@@ -920,6 +1245,34 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("IMAP_PORT", DEFAULT_PORT)),
         help="IMAP 端口",
     )
+    # ---- 第 4 步：投递 ----
+    p.add_argument(
+        "--deliver",
+        choices=["none", "auto", "webhook", "digest", "both"],
+        default="auto",
+        help="投递方式：none 只打印；webhook 群机器人；digest 写日报；"
+        "both 两个都发；auto 有 webhook 就推、同时写日报（默认）",
+    )
+    p.add_argument(
+        "--webhook-url",
+        default="",
+        help="企业微信/飞书群机器人 Webhook 地址（也可用环境变量 WEBHOOK_URL）",
+    )
+    p.add_argument(
+        "--notify-min",
+        choices=list(PRIORITY_ORDER),
+        default="P1",
+        help="推到群里的最低紧急度，默认 P1（即 P0+P1）",
+    )
+    p.add_argument(
+        "--digest-dir", default="state/digest", help="日报 markdown 落盘目录"
+    )
+    p.add_argument(
+        "--mask", action="store_true", help="打码发件人姓名与地址（公开仓库日志用）"
+    )
+    p.add_argument(
+        "--demo", action="store_true", help="离线演示：读 examples/emails/*.eml 跑完整管线"
+    )
     return p.parse_args()
 
 
@@ -934,13 +1287,21 @@ def run(args: argparse.Namespace) -> int:
         log.error("缺少环境变量 QQ_EMAIL 或 QQ_AUTH_CODE")
         return 2
 
+    started = datetime.now(CST)
     debug_uids = parse_uid_list(args.uid) if args.uid.strip() else []
     state_path = Path(args.state)
     state = load_state(state_path)
     conn: imaplib.IMAP4_SSL | None = None
+    results: dict[int, dict] = {}
+    cstats: dict = {}
 
     try:
-        log.info("连接 %s:%s（账号 %s）", args.host, args.port, email_addr)
+        log.info(
+            "连接 %s:%s（账号 %s）",
+            args.host,
+            args.port,
+            mask_addr(email_addr) if args.mask else email_addr,
+        )
         conn = imaplib.IMAP4_SSL(args.host, args.port, timeout=30)
         conn.login(email_addr, auth_code)
         log.info("登录成功")
@@ -1011,7 +1372,7 @@ def run(args: argparse.Namespace) -> int:
                 log.warning("未配置 LLM_API_KEY，本次只做清洗，不做分级")
             else:
                 try:
-                    results = classify(
+                    results, cstats = classify(
                         records,
                         cfg,
                         max(1, args.batch_size),
@@ -1040,14 +1401,50 @@ def run(args: argparse.Namespace) -> int:
             total_raw // 1024,
         )
 
+        # ---- 第 4 步：投递 ----
+        pushed: list[dict] = []
+        if results and args.deliver != "none":
+            items = build_items(records, results)
+            meta = build_meta(items, started, model=(cfg or {}).get("model", ""))
+            try:
+                outs, pushed = deliver_all(items, args, meta, state)
+            except Exception as exc:
+                log.error("投递过程出错，本次不推进游标（下次重试）：%s", exc)
+                return 5
+            for r in outs:
+                log.info("投递 %s：%s —— %s", r.channel, "成功" if r.ok else "失败", r.detail)
+            if any(not r.ok for r in outs):
+                log.error("有投递出口失败，本次不推进游标（下次重试同一批）")
+                return 5
+        elif results:
+            log.info("--deliver none：只打印，不投递")
+
         if debug_uids:
             log.info("调试模式结束，游标保持 last_uid=%s 未改动", state["last_uid"])
             return 0
 
+        stamp = now_iso()
+        ledger = dict(state.get("delivered") or {})
+        for it in pushed:
+            ledger[it["message_id"]] = {
+                "uid": it["uid"],
+                "priority": it["priority"],
+                "at": stamp,
+            }
+        state["delivered"] = prune_delivered(ledger)
+        old_stats = state.get("stats") or {}
+        state["stats"] = {
+            "runs": int(old_stats.get("runs") or 0) + 1,
+            "tokens_in": int(old_stats.get("tokens_in") or 0)
+            + int(cstats.get("tokens_in") or 0),
+            "tokens_out": int(old_stats.get("tokens_out") or 0)
+            + int(cstats.get("tokens_out") or 0),
+        }
+
         state.update(
             uidvalidity=uidvalidity,
             last_uid=max(batch),
-            last_run=now_iso(),
+            last_run=stamp,
             initialized=True,
         )
         save_state(state_path, state)
@@ -1065,6 +1462,10 @@ def run(args: argparse.Namespace) -> int:
         else:
             log.error("IMAP 错误: %s", text)
         return 3
+    except Exception as exc:  # 兜底：任何没预料到的异常都要有可读日志和退出码
+        log.error("运行失败（%s）：%s", type(exc).__name__, exc)
+        log.debug("详细堆栈", exc_info=True)
+        return 1
     finally:
         if conn is not None:
             try:
@@ -1083,7 +1484,20 @@ def main() -> int:
         datefmt="%H:%M:%S",
         stream=sys.stdout,
     )
-    return run(parse_args())
+    args = parse_args()
+    if os.environ.get("LOG_MASK", "").strip() in ("1", "true", "yes"):
+        args.mask = True  # CI 里日志是公开的，强制打码
+    try:
+        if args.demo:
+            return run_demo(args)
+        return run(args)
+    except KeyboardInterrupt:
+        log.warning("已中断")
+        return 130
+    except Exception as exc:  # 兜底，避免裸 traceback 破坏退出码约定
+        log.error("运行失败（%s）：%s", type(exc).__name__, exc)
+        log.debug("详细堆栈", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":

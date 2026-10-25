@@ -1,0 +1,40 @@
+name: ci
+
+# 每次 push / PR 都跑：语法检查 + 单元测试 + 离线演示管线。
+# 全部离线：不连 IMAP、不调模型、不碰真邮箱，所以 fork 的 PR 也能跑。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 语法检查
+        run: python -m compileall -q scripts tests examples
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: 离线演示（完整管线，无密钥）
+        run: python scripts/fetch_mail.py --demo --deliver none --preview 0
+
+      - name: 演示 + 写日报
+        run: python scripts/fetch_mail.py --demo --deliver digest --digest-dir "$RUNNER_TEMP/digest" --preview 0
