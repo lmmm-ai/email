@@ -98,4 +98,4 @@ jobs:
           git commit -q -m "chore(state): mail cursor $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git push -q origin HEAD:state
           echo "游标已保存到 state 分支"
-update
+
