@@ -1,7 +1,7 @@
 name: mail-check
 
-# 第 2 步：定时取信 -> 取正文 -> 清洗（剥引用/签名）-> 打印预览。
-# 仍然不调用 LLM、不写外部系统。第 3 步才接分类。
+# 第 3 步：定时取信 -> 清洗正文 -> LLM 分级（摘要/紧急度/待办）-> 打印工作清单。
+# 仍然只打印，不建 Issue、不发通知（第 4 步）。
 
 on:
   schedule:
@@ -16,6 +16,10 @@ on:
         default: "20"
       uids:
         description: "调试用：强制处理指定 UID（如 34,36 或 30-38），留空走正常增量"
+        required: false
+        default: ""
+      no_llm:
+        description: "调试用：填 true 则只清洗不调模型（不花钱）"
         required: false
         default: ""
 
@@ -57,15 +61,22 @@ jobs:
             echo "state 分支还不存在（首次运行）"
           fi
 
-      - name: 取信 + 清洗正文
+      - name: 取信 + 清洗 + 分级
         env:
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
+          # 没配 LLM_API_KEY 时会自动降级为"只清洗不分级"，不会报错
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
           set -euo pipefail
           args=(--state state/mail_state.json --limit "${{ inputs.limit || 20 }}")
           if [ -n "${{ inputs.uids }}" ]; then
             args+=(--uid "${{ inputs.uids }}")
+          fi
+          if [ -n "${{ inputs.no_llm }}" ]; then
+            args+=(--no-llm)
           fi
           python scripts/fetch_mail.py "${args[@]}"
 
