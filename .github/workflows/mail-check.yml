@@ -1,7 +1,7 @@
 name: mail-check
 
-# 第 1 步：定时登录 QQ 邮箱，把"新邮件标题"打印到 Actions 日志里。
-# 不取正文、不调用任何 LLM、不写入任何外部系统。
+# 第 2 步：定时取信 -> 取正文 -> 清洗（剥引用/签名）-> 打印预览。
+# 仍然不调用 LLM、不写外部系统。第 3 步才接分类。
 
 on:
   schedule:
@@ -14,6 +14,10 @@ on:
         description: "本次最多处理多少封邮件"
         required: false
         default: "20"
+      uids:
+        description: "调试用：强制处理指定 UID（如 34,36 或 30-38），留空走正常增量"
+        required: false
+        default: ""
 
 # 同一时间只允许一个实例，避免两次运行同时读写游标
 concurrency:
@@ -53,15 +57,17 @@ jobs:
             echo "state 分支还不存在（首次运行）"
           fi
 
-      - name: 取新邮件标题
+      - name: 取信 + 清洗正文
         env:
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
         run: |
           set -euo pipefail
-          python scripts/fetch_mail.py \
-            --state state/mail_state.json \
-            --limit "${{ inputs.limit || 20 }}"
+          args=(--state state/mail_state.json --limit "${{ inputs.limit || 20 }}")
+          if [ -n "${{ inputs.uids }}" ]; then
+            args+=(--uid "${{ inputs.uids }}")
+          fi
+          python scripts/fetch_mail.py "${args[@]}"
 
       - name: 保存游标（推回 state 分支）
         if: always()
@@ -98,4 +104,3 @@ jobs:
           git commit -q -m "chore(state): mail cursor $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git push -q origin HEAD:state
           echo "游标已保存到 state 分支"
-
