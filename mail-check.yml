@@ -1,0 +1,100 @@
+name: mail-check
+
+# 第 1 步：定时登录 QQ 邮箱，把"新邮件标题"打印到 Actions 日志里。
+# 不取正文、不调用任何 LLM、不写入任何外部系统。
+
+on:
+  schedule:
+    # 注意：GitHub 的 cron 一律是 UTC。
+    # */30 1-14 * * 1-5  =>  北京时间 09:00–22:30，每 30 分钟，周一到周五
+    - cron: "*/30 1-14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "本次最多处理多少封邮件"
+        required: false
+        default: "20"
+
+# 同一时间只允许一个实例，避免两次运行同时读写游标
+concurrency:
+  group: mail-check
+  cancel-in-progress: false
+
+# 需要写权限，才能把游标推回 state 分支
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 恢复游标（从 state 分支）
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          if git fetch --depth=1 origin state 2>/dev/null; then
+            if git show FETCH_HEAD:state/mail_state.json > state/mail_state.json 2>/dev/null; then
+              echo "已恢复游标："
+              cat state/mail_state.json
+            else
+              echo "state 分支存在但没有游标文件，按首次运行处理"
+              rm -f state/mail_state.json
+            fi
+          else
+            echo "state 分支还不存在（首次运行）"
+          fi
+
+      - name: 取新邮件标题
+        env:
+          QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+          QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
+        run: |
+          set -euo pipefail
+          python scripts/fetch_mail.py \
+            --state state/mail_state.json \
+            --limit "${{ inputs.limit || 20 }}"
+
+      - name: 保存游标（推回 state 分支）
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f state/mail_state.json ]; then
+            echo "没有游标文件，跳过保存（多半是取信步骤失败了）"
+            exit 0
+          fi
+          # 先备份到临时目录，因为下面切分支会把工作区换掉
+          cp state/mail_state.json "$RUNNER_TEMP/mail_state.json"
+
+          git config user.name  "mailbot"
+          git config user.email "mailbot@users.noreply.github.com"
+
+          if git fetch --depth=1 origin state 2>/dev/null; then
+            git switch -C state FETCH_HEAD
+          else
+            # 新 git 的 switch --orphan 会自己清空 index，旧版本不会；
+            # 两种行为都兼容：清过了就报 "pathspec did not match"，忽略即可
+            git switch --orphan state
+            git rm -rf --quiet . 2>/dev/null || true
+          fi
+
+          mkdir -p state
+          cp "$RUNNER_TEMP/mail_state.json" state/mail_state.json
+          git add -f state/mail_state.json
+
+          if git diff --cached --quiet; then
+            echo "游标未变化，无需提交"
+            exit 0
+          fi
+
+          git commit -q -m "chore(state): mail cursor $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -q origin HEAD:state
+          echo "游标已保存到 state 分支"
